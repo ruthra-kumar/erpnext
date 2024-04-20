@@ -85,6 +85,10 @@ def get_party_tax_withholding_details(inv, tax_withholding_category=None):
 	if inv.doctype == "Payment Entry":
 		inv.tax_withholding_net_total = inv.net_total
 
+	tcs = TCSCalculation(inv)
+	ret = tcs.calculate()
+	print(ret)
+
 	pan_no = ""
 	parties = []
 	party_type, party = get_party_details(inv)
@@ -313,6 +317,7 @@ def get_tax_amount(party_type, parties, inv, tax_details, posting_date, pan_no=N
 			# then chargeable value is "prev invoices + advances" value which cross the threshold
 			tax_amount = get_tcs_amount(parties, inv, tax_details, vouchers, advance_vouchers)
 
+	print("tax_amount: ", tax_amount)
 	if cint(tax_details.round_off_tax_amount):
 		tax_amount = normal_round(tax_amount)
 
@@ -563,8 +568,6 @@ def get_tcs_amount(parties, inv, tax_details, vouchers, adv_vouchers):
 	conditions.append(ple.voucher_no == ple.against_voucher_no)
 	conditions.append(ple.company == inv.company)
 
-	qb.from_(ple).select(Abs(Sum(ple.amount))).where(Criterion.all(conditions)).run(as_list=1)
-
 	advance_amt = (
 		qb.from_(ple).select(Abs(Sum(ple.amount))).where(Criterion.all(conditions)).run()[0][0] or 0.0
 	)
@@ -655,3 +658,242 @@ def normal_round(number):
 	number = int(number) + decimal_part
 
 	return number
+
+
+from abc import ABC, abstractmethod, abstractproperty
+
+
+class TaxWithholdingCalculation(ABC):
+	# @abstractmethod
+	# def get_vouchers(self):
+	# 	pass
+
+	@abstractmethod
+	def calculate(self):
+		pass
+
+
+class TCSCalculation(Document, TaxWithholdingCalculation):
+	def __init__(self, doc: dict | Document | None):
+		self.doc = doc
+		self.parties: set = set()
+		self.tax_breakup = frappe._dict()
+		self.posting_date = self.doc.get("posting_date")
+		self.initialize_withholding_details()
+		self.tax_details = get_tax_withholding_details(
+			self.tax_withholding_category, self.posting_date, self.doc.get("company")
+		)
+		self.initialize_parties()
+
+	def initialize_withholding_details(self):
+		self.party_type, self.party = get_party_details(self.doc)
+		# 'pan' is added by India Compliance on Customer, Supplier and Company
+		# make sure that field exists before fetching
+		has_pan_field = frappe.get_meta(self.party_type).has_field("pan")
+
+		if has_pan_field:
+			fields = ["tax_withholding_category", "pan"]
+		else:
+			fields = ["tax_withholding_category"]
+
+		res = frappe.db.get_value(self.party_type, self.party, fields, as_dict=1)
+		self.tax_withholding_category = res.get("tax_withholding_category")
+		self.pan_no = res.get("pan")
+
+	def initialize_parties(self):
+		self.parties.add(self.party)
+		# all customers with same pan number will be considered as one
+		if self.pan_no:
+			self.parties.update(
+				set(frappe.get_all(self.party_type, filters={"pan": self.pan_no}, pluck="name"))
+			)
+		self.tax_breakup.parties = self.parties
+
+	def validate_cumulative_threshold(self):
+		# TCS is only chargeable on sum of invoiced value
+		if not self.tax_details.cumulative_threshold:
+			frappe.throw(
+				_(
+					"Tax Withholding Category {} against Company {} for Customer {} should have Cumulative Threshold value."
+				).format(self.tax_withholding_category, self.doc.company, self.party)
+			)
+
+	def get_vouchers(self):
+		# What is the need for method for Sales cycle?
+		self.voucher_wise_amount = {}
+		self.vouchers = []
+
+		si = qb.DocType("Sales Invoice")
+		invoice_details = (
+			qb.from_(si)
+			.select(si.name, si.base_net_total)
+			.where(
+				(si.company.eq(self.doc.company))
+				& (si[self.party_type].isin(self.parties))
+				& (si.posting_date[self.tax_details.from_date : self.tax_details.to_date])
+				& (si.is_opening.eq("No"))
+				& (si.docstatus.eq(1))
+			)
+			.run(as_dict=True)
+		)
+
+		for d in invoice_details:
+			self.vouchers.append(d.name)
+			self.voucher_wise_amount.update(
+				{d.name: {"amount": d.base_net_total, "voucher_type": "Sales Invoice"}}
+			)
+
+		je = qb.DocType("Journal Entry")
+		jea = qb.DocType("Journal Entry Account")
+		journals = (
+			qb.from_(je)
+			.inner_join(jea)
+			.on(je.name == jea.parent)
+			.select(je.name, (jea.credit - jea.debit).as_("amount"))
+			.where(
+				(je.docstatus.eq(1))
+				& (je.is_opening.eq("No"))
+				& (je.posting_date[self.tax_details.from_date : self.tax_details.to_date])
+				& (jea.party.isin(self.parties))
+				& (je.apply_tds.eq(1))
+				& (je.tax_withholding_category.eq(self.tax_details.get("tax_withholding_category")))
+			)
+			.run(as_dict=True)
+		)
+
+		for d in journals:
+			self.vouchers.append(d.name)
+			self.voucher_wise_amount.update({d.name: {"amount": d.amount, "voucher_type": "Journal Entry"}})
+
+		ple = qb.DocType("Payment Ledger Entry")
+		self.advances = (
+			qb.from_(ple)
+			.select(ple.voucher_no)
+			.distinct()
+			.where(
+				(ple.amount.lt(0))
+				& (ple.delinked.eq(0))
+				& (ple.party_type == self.party_type)
+				& (ple.party.isin(self.parties))
+				& (ple.voucher_no == ple.against_voucher_no)
+				& (ple.company == self.doc.company)
+				& (ple.posting_date[self.tax_details.from_date : self.tax_details.to_date])
+			)
+			.run(as_list=1)
+		)
+		if self.advances:
+			self.advances = [x[0] for x in self.advances]
+
+	def get_deducted_tax(self):
+		self.taxable_vouchers = self.vouchers + self.advances
+		# Need to refactor below method
+		self.tax_deducted = get_deducted_tax(self.taxable_vouchers, self.tax_details)
+
+	def get_invoice_total_without_tcs(self):
+		tcs_tax_row = [d for d in self.doc.taxes if d.account_head == self.tax_details.account_head]
+		tcs_tax_row_amount = tcs_tax_row[0].base_tax_amount if tcs_tax_row else 0
+		return self.doc.grand_total - tcs_tax_row_amount
+
+	def generate_tax_breakup(self):
+		self.breakup = []
+		self.breakup.append(frappe._dict(voucher_no="opening", amt=0))
+		for x in self.vouchers:
+			self.breakup.append(x)
+
+		for x in self.advances:
+			self.breakup.append(x)
+
+		self.breakup.append(frappe._dict(voucher_no="Tax Deducted", amt=self.tax_deducted))
+
+	def calculate_tcs_amount(self):
+		self.tcs_amount = 0
+		ple = qb.DocType("Payment Ledger Entry")
+		# sum of debit entries made from sales invoices
+		self.invoiced_amt = (
+			frappe.db.get_value(
+				"GL Entry",
+				{
+					"is_cancelled": 0,
+					"party_type": "Customer",
+					"party": ["in", self.parties],
+					"company": self.doc.company,
+					"voucher_no": ["in", self.vouchers],
+				},
+				"sum(debit)",
+			)
+			or 0.0
+		)
+
+		# sum of credit entries made from PE / JV with unset 'against voucher'
+		self.advance_amt = (
+			qb.from_(ple)
+			.select(Abs(Sum(ple.amount)))
+			.where(
+				(ple.amount.lt(0))
+				& (ple.delinked == 0)
+				& (ple.party_type == self.party_type)
+				& (ple.party.isin(self.parties))
+				& (ple.voucher_no == ple.against_voucher_no)
+				& (ple.company == self.doc.company)
+			)
+			.run()[0][0]
+			or 0.0
+		)
+
+		# sum of credit entries made from sales invoice
+		self.credit_note_amt = sum(
+			frappe.db.get_all(
+				"GL Entry",
+				{
+					"is_cancelled": 0,
+					"credit": [">", 0],
+					"party_type": self.party_type,
+					"party": ["in", self.parties],
+					"posting_date": ["between", (self.tax_details.from_date, self.tax_details.to_date)],
+					"company": self.doc.company,
+					"voucher_type": "Sales Invoice",
+				},
+				pluck="credit",
+			)
+		)
+		cumulative_threshold = self.tax_details.get("cumulative_threshold", 0)
+
+		self.current_invoice_total = self.get_invoice_total_without_tcs()
+		total_invoiced_amt = (
+			self.current_invoice_total + self.invoiced_amt + self.advance_amt - self.credit_note_amt
+		)
+
+		if cumulative_threshold and total_invoiced_amt >= cumulative_threshold:
+			chargeable_amt = total_invoiced_amt - cumulative_threshold
+			self.tcs_amount = chargeable_amt * self.tax_details.rate / 100 if chargeable_amt > 0 else 0
+
+	def calculate(self):
+		self.validate_cumulative_threshold()
+		self.get_vouchers()
+		self.get_deducted_tax()
+		if self.tax_deducted:
+			# if already TCS is charged, then amount will be calculated based on 'Previous Row Total'
+			# by get_tax_row_for_tcs() method
+			self.tcs_amount = 0
+		else:
+			#  if no TCS has been charged in FY,
+			# then chargeable value is "prev invoices + advances" value which cross the threshold
+
+			# NOTES: If TDS is deduced, in previous vouchers, then below logic doesn't run
+			# Why?
+			# self.tcs_amount = get_tcs_amount(
+			# 	self.parties, self.doc, self.tax_details, self.vouchers, self.advances
+			# )
+			self.calculate_tcs_amount()
+
+		return {
+			"current": self.get("current_invoice_total"),
+			"invoiced": self.get("invoiced_amt"),
+			"advance": self.get("advance_amt"),
+			"credit_amt": self.get("credit_note_amt"),
+			"tax_deducted": self.tax_deducted,
+			"tcs_amount": self.tcs_amount,
+			"vouchers": self.vouchers,
+			"advances": self.advances,
+			"voucher_wise": self.voucher_wise_amount,
+		}
