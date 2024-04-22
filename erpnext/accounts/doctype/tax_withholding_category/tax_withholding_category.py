@@ -718,13 +718,7 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 				).format(self.tax_withholding_category, self.doc.company, self.party)
 			)
 
-	def get_vouchers(self):
-		"""
-		Identify and fetch Sales Invoices, Payments and Journals that will be considered for TCS calculation
-		"""
-		self.voucher_wise_amount = {}
-		self.vouchers = []
-
+	def get_sales_invoices(self):
 		si = qb.DocType("Sales Invoice")
 		invoice_details = (
 			qb.from_(si)
@@ -738,14 +732,9 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 			)
 			.run(as_dict=True)
 		)
-
 		self.vouchers.extend(invoice_details)
-		# for d in invoice_details:
-		# 	self.vouchers.append(d.name)
-		# 	self.voucher_wise_amount.update(
-		# 		{d.name: {"amount": d.base_net_total, "voucher_type": "Sales Invoice"}}
-		# 	)
 
+	def get_journals(self):
 		je = qb.DocType("Journal Entry")
 		jea = qb.DocType("Journal Entry Account")
 		journals = (
@@ -765,15 +754,13 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 		)
 
 		self.vouchers.extend(journals)
-		# for d in journals:
-		# 	self.vouchers.append(d.name)
-		# 	self.voucher_wise_amount.update({d.name: {"amount": d.amount, "voucher_type": "Journal Entry"}})
 
+	def get_advance_payments(self):
 		# identify advance payment through Payment Ledger
 		ple = qb.DocType("Payment Ledger Entry")
 		self.advances = (
 			qb.from_(ple)
-			.select(ple.voucher_no.as_("name"), Abs(ple.amount))
+			.select(ple.voucher_no.as_("name"), Abs(ple.amount).as_("amount"))
 			.distinct()
 			.where(
 				(ple.amount.lt(0))
@@ -784,11 +771,18 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 				& (ple.company == self.doc.company)
 				& (ple.posting_date[self.tax_details.from_date : self.tax_details.to_date])
 			)
-			.run(as_list=1)
+			.run(as_dict=True)
 		)
 		self.vouchers.extend(self.advances)
-		# if self.advances:
-		# 	self.advances = [x[0] for x in self.advances]
+
+	def get_vouchers(self):
+		"""
+		Identify and fetch Sales Invoices, Payments and Journals that will be considered for TCS calculation
+		"""
+		self.vouchers = []
+		self.get_sales_invoices()
+		self.get_journals()
+		self.get_advance_payments()
 
 	def get_deducted_tax(self):
 		# check if TDS / TCS account is already charged on taxable vouchers
@@ -804,8 +798,8 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 				& (gle.account.eq(self.tax_details.account_head))
 				& (gle.voucher_no.isin(taxable_vouchers))
 			)
-			.run()
-		) or 0.0
+			.run(as_list=True)
+		)[0][0] or 0.0
 
 	def get_invoice_total_without_tcs(self):
 		tcs_tax_row = [d for d in self.doc.taxes if d.account_head == self.tax_details.account_head]
@@ -825,61 +819,66 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 
 	def calculate_tcs_amount(self):
 		self.tcs_amount = 0
-		ple = qb.DocType("Payment Ledger Entry")
-		# sum of debit entries made from sales invoices
-		self.invoiced_amt = (
-			frappe.db.get_value(
-				"GL Entry",
-				{
-					"is_cancelled": 0,
-					"party_type": "Customer",
-					"party": ["in", self.parties],
-					"company": self.doc.company,
-					"voucher_no": ["in", self.vouchers],
-				},
-				"sum(debit)",
-			)
-			or 0.0
-		)
+		# ple = qb.DocType("Payment Ledger Entry")
+		# # sum of debit entries made from sales invoices
+		# self.invoiced_amt = (
+		# 	frappe.db.get_value(
+		# 		"GL Entry",
+		# 		{
+		# 			"is_cancelled": 0,
+		# 			"party_type": "Customer",
+		# 			"party": ["in", self.parties],
+		# 			"company": self.doc.company,
+		# 			"voucher_no": ["in", self.vouchers],
+		# 		},
+		# 		"sum(debit)",
+		# 	)
+		# 	or 0.0
+		# )
 
-		# sum of credit entries made from PE / JV with unset 'against voucher'
-		self.advance_amt = (
-			qb.from_(ple)
-			.select(Abs(Sum(ple.amount)))
-			.where(
-				(ple.amount.lt(0))
-				& (ple.delinked == 0)
-				& (ple.party_type == self.party_type)
-				& (ple.party.isin(self.parties))
-				& (ple.voucher_no == ple.against_voucher_no)
-				& (ple.company == self.doc.company)
-			)
-			.run()[0][0]
-			or 0.0
-		)
+		# # sum of credit entries made from PE / JV with unset 'against voucher'
+		# self.advance_amt = (
+		# 	qb.from_(ple)
+		# 	.select(Abs(Sum(ple.amount)))
+		# 	.where(
+		# 		(ple.amount.lt(0))
+		# 		& (ple.delinked == 0)
+		# 		& (ple.party_type == self.party_type)
+		# 		& (ple.party.isin(self.parties))
+		# 		& (ple.voucher_no == ple.against_voucher_no)
+		# 		& (ple.company == self.doc.company)
+		# 	)
+		# 	.run()[0][0]
+		# 	or 0.0
+		# )
 
-		# sum of credit entries made from sales invoice
-		self.credit_note_amt = sum(
-			frappe.db.get_all(
-				"GL Entry",
-				{
-					"is_cancelled": 0,
-					"credit": [">", 0],
-					"party_type": self.party_type,
-					"party": ["in", self.parties],
-					"posting_date": ["between", (self.tax_details.from_date, self.tax_details.to_date)],
-					"company": self.doc.company,
-					"voucher_type": "Sales Invoice",
-				},
-				pluck="credit",
-			)
-		)
-		cumulative_threshold = self.tax_details.get("cumulative_threshold", 0)
+		# # sum of credit entries made from sales invoice
+		# self.credit_note_amt = sum(
+		# 	frappe.db.get_all(
+		# 		"GL Entry",
+		# 		{
+		# 			"is_cancelled": 0,
+		# 			"credit": [">", 0],
+		# 			"party_type": self.party_type,
+		# 			"party": ["in", self.parties],
+		# 			"posting_date": ["between", (self.tax_details.from_date, self.tax_details.to_date)],
+		# 			"company": self.doc.company,
+		# 			"voucher_type": "Sales Invoice",
+		# 		},
+		# 		pluck="credit",
+		# 	)
+		# )
 
 		self.current_invoice_total = self.get_invoice_total_without_tcs()
-		total_invoiced_amt = (
-			self.current_invoice_total + self.invoiced_amt + self.advance_amt - self.credit_note_amt
-		)
+		cumulative_threshold = self.tax_details.get("cumulative_threshold", 0)
+		total_invoiced_amt = 0
+		for x in self.vouchers:
+			print(x)
+			total_invoiced_amt += x.amount
+		total_invoiced_amt += self.current_invoice_total
+		# (
+		# 	self.current_invoice_total + self.invoiced_amt + self.advance_amt - self.credit_note_amt
+		# )
 
 		if cumulative_threshold and total_invoiced_amt >= cumulative_threshold:
 			chargeable_amt = total_invoiced_amt - cumulative_threshold
@@ -913,5 +912,4 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 			"tcs_amount": self.tcs_amount,
 			"vouchers": self.vouchers,
 			"advances": self.advances,
-			"voucher_wise": self.voucher_wise_amount,
 		}
