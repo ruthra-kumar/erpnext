@@ -719,14 +719,16 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 			)
 
 	def get_vouchers(self):
-		# What is the need for method for Sales cycle?
+		"""
+		Identify and fetch Sales Invoices, Payments and Journals that will be considered for TCS calculation
+		"""
 		self.voucher_wise_amount = {}
 		self.vouchers = []
 
 		si = qb.DocType("Sales Invoice")
 		invoice_details = (
 			qb.from_(si)
-			.select(si.name, si.base_net_total)
+			.select(si.name, si.base_net_total.as_("amount"))
 			.where(
 				(si.company.eq(self.doc.company))
 				& (si[self.party_type].isin(self.parties))
@@ -737,11 +739,12 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 			.run(as_dict=True)
 		)
 
-		for d in invoice_details:
-			self.vouchers.append(d.name)
-			self.voucher_wise_amount.update(
-				{d.name: {"amount": d.base_net_total, "voucher_type": "Sales Invoice"}}
-			)
+		self.vouchers.extend(invoice_details)
+		# for d in invoice_details:
+		# 	self.vouchers.append(d.name)
+		# 	self.voucher_wise_amount.update(
+		# 		{d.name: {"amount": d.base_net_total, "voucher_type": "Sales Invoice"}}
+		# 	)
 
 		je = qb.DocType("Journal Entry")
 		jea = qb.DocType("Journal Entry Account")
@@ -761,14 +764,16 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 			.run(as_dict=True)
 		)
 
-		for d in journals:
-			self.vouchers.append(d.name)
-			self.voucher_wise_amount.update({d.name: {"amount": d.amount, "voucher_type": "Journal Entry"}})
+		self.vouchers.extend(journals)
+		# for d in journals:
+		# 	self.vouchers.append(d.name)
+		# 	self.voucher_wise_amount.update({d.name: {"amount": d.amount, "voucher_type": "Journal Entry"}})
 
+		# identify advance payment through Payment Ledger
 		ple = qb.DocType("Payment Ledger Entry")
 		self.advances = (
 			qb.from_(ple)
-			.select(ple.voucher_no)
+			.select(ple.voucher_no.as_("name"), Abs(ple.amount))
 			.distinct()
 			.where(
 				(ple.amount.lt(0))
@@ -781,13 +786,26 @@ class TCSCalculation(Document, TaxWithholdingCalculation):
 			)
 			.run(as_list=1)
 		)
-		if self.advances:
-			self.advances = [x[0] for x in self.advances]
+		self.vouchers.extend(self.advances)
+		# if self.advances:
+		# 	self.advances = [x[0] for x in self.advances]
 
 	def get_deducted_tax(self):
-		self.taxable_vouchers = self.vouchers + self.advances
-		# Need to refactor below method
-		self.tax_deducted = get_deducted_tax(self.taxable_vouchers, self.tax_details)
+		# check if TDS / TCS account is already charged on taxable vouchers
+		taxable_vouchers = [x.name for x in self.vouchers]
+		gle = qb.DocType("GL Entry")
+		self.tax_deducted = (
+			qb.from_(gle)
+			.select(Sum(gle.credit))
+			.where(
+				(gle.is_cancelled.eq(0))
+				& (gle.credit.gt(0))
+				& (gle.posting_date[self.tax_details.from_date : self.tax_details.to_date])
+				& (gle.account.eq(self.tax_details.account_head))
+				& (gle.voucher_no.isin(taxable_vouchers))
+			)
+			.run()
+		) or 0.0
 
 	def get_invoice_total_without_tcs(self):
 		tcs_tax_row = [d for d in self.doc.taxes if d.account_head == self.tax_details.account_head]
