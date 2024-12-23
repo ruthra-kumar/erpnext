@@ -1992,6 +1992,7 @@ class TestAccountsController(IntegrationTestCase):
 		adv.save()
 		self.assertEqual(adv.paid_from, self.advance_received_usd)
 		adv.submit()
+		adv.reload()
 
 		# create sales invoice with advance received
 		si = self.create_sales_invoice(qty=1, conversion_rate=80, rate=1, do_not_submit=True)
@@ -1999,8 +2000,8 @@ class TestAccountsController(IntegrationTestCase):
 		si.append(
 			"advances",
 			{
-				"reference_type": "Payment Entry",
-				"reference_name": "ACC-PAY-2024-00001",
+				"reference_type": adv.doctype,
+				"reference_name": adv.name,
 				"remarks": "Amount INR 1 received from _Test MC Customer USD\nTransaction reference no Test001 dated 2024-12-19",
 				"advance_amount": 1.0,
 				"allocated_amount": 1.0,
@@ -2050,8 +2051,8 @@ class TestAccountsController(IntegrationTestCase):
 		pi.append(
 			"advances",
 			{
-				"reference_type": "Payment Entry",
-				"reference_name": "ACC-PAY-2024-00002",
+				"reference_type": adv.doctype,
+				"reference_name": adv.name,
 				"remarks": "Amount INR 1 paid to _Test MC Supplier USD\nTransaction reference no Test001 dated 2024-12-20",
 				"advance_amount": 1.0,
 				"allocated_amount": 1.0,
