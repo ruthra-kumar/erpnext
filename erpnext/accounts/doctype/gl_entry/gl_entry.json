@@ -5,7 +5,6 @@
  "doctype": "DocType",
  "document_type": "Document",
  "engine": "InnoDB",
- "is_submittable": 1,
  "field_order": [
   "dates_section",
   "posting_date",
@@ -53,7 +52,8 @@
   "column_break_8abq",
   "to_rename",
   "is_cancelled",
-  "remarks"
+  "remarks",
+  "amended_from"
  ],
  "fields": [
   {
@@ -375,17 +375,28 @@
    "fieldtype": "Float",
    "label": "Reporting Currency Exchange Rate",
    "precision": "9"
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "GL Entry",
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1
   }
  ],
  "icon": "fa fa-list",
  "idx": 1,
  "in_create": 1,
+ "is_submittable": 1,
  "links": [],
- "modified": "2025-08-22 12:57:17.750252",
+ "modified": "2026-04-15 17:10:42.196275",
  "modified_by": "Administrator",
  "module": "Accounts",
  "name": "GL Entry",
- "naming_rule": "Expression (old style)",
+ "naming_rule": "Expression",
  "owner": "Administrator",
  "permissions": [
   {
@@ -416,5 +427,6 @@
  "search_fields": "voucher_no,account,posting_date,against_voucher",
  "sort_field": "creation",
  "sort_order": "DESC",
- "states": []
+ "states": [],
+ "sync_to_duckdb": 1
 }
