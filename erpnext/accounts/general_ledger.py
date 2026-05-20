@@ -33,6 +33,7 @@ def make_gl_entries(
 	update_outstanding="Yes",
 	from_repost=False,
 ):
+	print("Make GL Entries cancel:", cancel)
 	if gl_map:
 		if (
 			not cancel

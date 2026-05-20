@@ -2138,21 +2138,42 @@ def create_payment_ledger_entry(
 	if gl_entries:
 		ple_map = get_payment_ledger_entries(gl_entries, cancel=cancel)
 
-		for entry in ple_map:
-			ple = frappe.get_doc(entry)
+		if not ple_map:
+			return
 
-			if cancel:
-				delink_original_entry(ple, partial_cancel=partial_cancel)
+		if cancel and not partial_cancel:
+			ple_records = []
+			for entry in ple_map:
+				ple = frappe.get_doc(entry)
+				ple.flags.ignore_permissions = 1
+				ple.flags.adv_adj = adv_adj
+				ple.flags.from_repost = from_repost
+				ple.flags.update_outstanding = update_outstanding
 				if is_immutable_ledger_enabled():
 					ple.delinked = 0
 					ple.posting_date = frappe.form_dict.get("posting_date") or getdate()
-				ple.flags.ignore_links = True
+					ple.flags.ignore_links = True
 
-			ple.flags.ignore_permissions = 1
-			ple.flags.adv_adj = adv_adj
-			ple.flags.from_repost = from_repost
-			ple.flags.update_outstanding = update_outstanding
-			ple.submit()
+				ple_records.append(ple)
+			bulk_delink_original_entry(ples)
+		else:
+			for entry in ple_map:
+				ple = frappe.get_doc(entry)
+
+				print("Len:", len(ple_map))
+				print("cancel: ", cancel)
+				if cancel:
+					delink_original_entry(ple, partial_cancel=partial_cancel)
+					if is_immutable_ledger_enabled():
+						ple.delinked = 0
+						ple.posting_date = frappe.form_dict.get("posting_date") or getdate()
+					ple.flags.ignore_links = True
+
+				ple.flags.ignore_permissions = 1
+				ple.flags.adv_adj = adv_adj
+				ple.flags.from_repost = from_repost
+				ple.flags.update_outstanding = update_outstanding
+				ple.submit()
 
 
 def update_voucher_outstanding(voucher_type, voucher_no, account, party_type, party):
@@ -2206,6 +2227,30 @@ def update_voucher_outstanding(voucher_type, voucher_no, account, party_type, pa
 	ref_doc.notify_update()
 
 
+def delink_original_entry(ples):
+	if not ples:
+		return
+
+	ple = qb.DocType("Payment Ledger Entry")
+	query = (
+		qb.update(ple)
+		.set(ple.modified, now())
+		.set(ple.modified_by, frappe.session.user)
+		.where(
+			(ple.company == pl_entry.company)
+			& (ple.account_type == pl_entry.account_type)
+			& (ple.account == pl_entry.account)
+			& (ple.party_type == pl_entry.party_type)
+			& (ple.party == pl_entry.party)
+			& (ple.voucher_type == pl_entry.voucher_type)
+			& (ple.voucher_no == pl_entry.voucher_no)
+			& (ple.against_voucher_type == pl_entry.against_voucher_type)
+			& (ple.against_voucher_no == pl_entry.against_voucher_no)
+		)
+	)
+	query.run(debug=1)
+
+
 def delink_original_entry(pl_entry, partial_cancel=False):
 	if not pl_entry:
 		return
@@ -2252,7 +2297,8 @@ def delink_original_entry(pl_entry, partial_cancel=False):
 		if not is_immutable_ledger_enabled():
 			query = query.set(ple.delinked, True)
 
-		query.run()
+		print((pl_entry, partial_cancel))
+		query.run(debug=1)
 
 
 class QueryPaymentLedger:
@@ -2723,7 +2769,7 @@ def build_qb_match_conditions(doctype, user=None) -> list:
 
 
 def is_immutable_ledger_enabled():
-	return frappe.get_single_value("Accounts Settings", "enable_immutable_ledger")
+	return frappe.get_cached_value("Accounts Settings", None, "enable_immutable_ledger")
 
 
 PRE_SUBMIT_DOCTYPE_CONFIG = {

@@ -661,6 +661,7 @@ class SalesInvoice(SellingController):
 			self.cancel_pos_invoice_credit_note_generated_during_sales_invoice_mode()
 
 		self.update_billed_qty_in_scio()
+		frappe.throw("stop...")
 
 	def update_status_updater_args(self):
 		if not cint(self.update_stock):
